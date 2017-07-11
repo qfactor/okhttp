@@ -31,6 +31,7 @@ public final class Request {
   final Headers headers;
   final @Nullable RequestBody body;
   final Object tag;
+  final StatisticsObserver observer;
 
   private volatile CacheControl cacheControl; // Lazily initialized.
 
@@ -40,6 +41,7 @@ public final class Request {
     this.headers = builder.headers.build();
     this.body = builder.body;
     this.tag = builder.tag != null ? builder.tag : this;
+    this.observer = builder.observer;
   }
 
   public HttpUrl url() {
@@ -69,6 +71,8 @@ public final class Request {
   public Object tag() {
     return tag;
   }
+
+  public StatisticsObserver observer() { return observer; }
 
   public Builder newBuilder() {
     return new Builder(this);
@@ -103,6 +107,7 @@ public final class Request {
     Headers.Builder headers;
     RequestBody body;
     Object tag;
+    StatisticsObserver observer;
 
     public Builder() {
       this.method = "GET";
@@ -114,6 +119,7 @@ public final class Request {
       this.method = request.method;
       this.body = request.body;
       this.tag = request.tag;
+      this.observer = request.observer;
       this.headers = request.headers.newBuilder();
     }
 
@@ -248,6 +254,11 @@ public final class Request {
      */
     public Builder tag(Object tag) {
       this.tag = tag;
+      return this;
+    }
+
+    public Builder observer(StatisticsObserver observer) {
+      this.observer = observer;
       return this;
     }
 

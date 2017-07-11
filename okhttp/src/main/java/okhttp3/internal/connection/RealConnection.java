@@ -30,6 +30,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -328,7 +329,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
     // Make an SSL Tunnel on the first message pair of each SSL + proxy connection.
     String requestLine = "CONNECT " + Util.hostHeader(url, true) + " HTTP/1.1";
     while (true) {
-      Http1Codec tunnelConnection = new Http1Codec(null, null, source, sink);
+      Http1Codec tunnelConnection = new Http1Codec(null, null, source, sink, null);
       source.timeout().timeout(readTimeout, MILLISECONDS);
       sink.timeout().timeout(writeTimeout, MILLISECONDS);
       tunnelConnection.writeRequest(tunnelRequest.headers(), requestLine);
@@ -455,7 +456,8 @@ public final class RealConnection extends Http2Connection.Listener implements Co
       socket.setSoTimeout(client.readTimeoutMillis());
       source.timeout().timeout(client.readTimeoutMillis(), MILLISECONDS);
       sink.timeout().timeout(client.writeTimeoutMillis(), MILLISECONDS);
-      return new Http1Codec(client, streamAllocation, source, sink);
+      return new Http1Codec(client, streamAllocation, source, sink,
+        streamAllocation.statisticsData());
     }
   }
 
@@ -552,5 +554,12 @@ public final class RealConnection extends Http2Connection.Listener implements Co
         + " protocol="
         + protocol
         + '}';
+  }
+
+  private static AtomicInteger nextConnectionID = new AtomicInteger(1);
+  private int connectionID = nextConnectionID.getAndIncrement();
+
+  public int connectionID() {
+    return connectionID;
   }
 }

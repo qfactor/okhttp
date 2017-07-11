@@ -19,16 +19,23 @@ import java.io.IOException;
 import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.net.Socket;
+
 import okhttp3.Address;
+import okhttp3.CertificatePinner;
 import okhttp3.ConnectionPool;
+import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
 import okhttp3.Route;
+import okhttp3.StatisticsData;
 import okhttp3.internal.Internal;
 import okhttp3.internal.Util;
 import okhttp3.internal.http.HttpCodec;
 import okhttp3.internal.http2.ConnectionShutdownException;
 import okhttp3.internal.http2.ErrorCode;
 import okhttp3.internal.http2.StreamResetException;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.SSLSocketFactory;
 
 import static okhttp3.internal.Util.closeQuietly;
 
@@ -82,13 +89,40 @@ public final class StreamAllocation {
   private boolean released;
   private boolean canceled;
   private HttpCodec codec;
+  private StatisticsData statsData;
+
+  public StreamAllocation(OkHttpClient client, HttpUrl url, Object callStackTrace) {
+    this.connectionPool = client.connectionPool();
+    this.address = createAddress(client, url);
+    this.routeSelector = new RouteSelector(address, routeDatabase());
+    this.callStackTrace = callStackTrace;
+    statsData = new StatisticsData();
+    statsData.url = url;
+  }
 
   public StreamAllocation(ConnectionPool connectionPool, Address address, Object callStackTrace) {
     this.connectionPool = connectionPool;
     this.address = address;
     this.routeSelector = new RouteSelector(address, routeDatabase());
     this.callStackTrace = callStackTrace;
+    statsData = new StatisticsData();
   }
+
+  private Address createAddress(OkHttpClient client, HttpUrl url) {
+    SSLSocketFactory sslSocketFactory = null;
+    HostnameVerifier hostnameVerifier = null;
+    CertificatePinner certificatePinner = null;
+    if (url.isHttps()) {
+      sslSocketFactory = client.sslSocketFactory();
+      hostnameVerifier = client.hostnameVerifier();
+      certificatePinner = client.certificatePinner();
+    }
+
+    return new Address(url.host(), url.port(), client.dns(), client.socketFactory(),
+            sslSocketFactory, hostnameVerifier, certificatePinner, client.proxyAuthenticator(),
+            client.proxy(), client.protocols(), client.connectionSpecs(), client.proxySelector());
+  }
+
 
   public HttpCodec newStream(OkHttpClient client, boolean doExtensiveHealthChecks) {
     int connectTimeout = client.connectTimeoutMillis();
@@ -99,6 +133,8 @@ public final class StreamAllocation {
     try {
       RealConnection resultConnection = findHealthyConnection(connectTimeout, readTimeout,
           writeTimeout, connectionRetryEnabled, doExtensiveHealthChecks);
+      statsData.route = resultConnection.route();
+      statsData.connectionID = resultConnection.connectionID();
       HttpCodec resultCodec = resultConnection.newCodec(client, this);
 
       synchronized (connectionPool) {
@@ -108,6 +144,15 @@ public final class StreamAllocation {
     } catch (IOException e) {
       throw new RouteException(e);
     }
+  }
+
+  public StatisticsData statisticsData() { return statsData; }
+
+  public void resetStatistics(HttpUrl url) {
+    statsData = new StatisticsData();
+    statsData.url = url;
+    if (codec != null)  // can be null on cached responses for instance.
+      codec.resetStatistics(statsData);
   }
 
   /**
@@ -166,10 +211,14 @@ public final class StreamAllocation {
       selectedRoute = route;
     }
 
+    statsData.initiateDNSQueryAtMillis = System.currentTimeMillis();
+
     // If we need a route, make one. This is a blocking operation.
     if (selectedRoute == null) {
       selectedRoute = routeSelector.next();
     }
+
+    statsData.finishDNSQueryAtMillis = System.currentTimeMillis();
 
     RealConnection result;
     synchronized (connectionPool) {
@@ -191,9 +240,12 @@ public final class StreamAllocation {
       acquire(result);
     }
 
+    statsData.initiateConnectAtMillis = statsData.finishDNSQueryAtMillis;
     // Do TCP + TLS handshakes. This is a blocking operation.
     result.connect(connectTimeout, readTimeout, writeTimeout, connectionRetryEnabled);
     routeDatabase().connected(result.route());
+    statsData.finishConnectAtMillis = System.currentTimeMillis();
+    statsData.isNewConnection = true;
 
     Socket socket = null;
     synchronized (connectionPool) {
@@ -205,6 +257,8 @@ public final class StreamAllocation {
       if (result.isMultiplexed()) {
         socket = Internal.instance.deduplicate(connectionPool, address, this);
         result = connection;
+        if (socket != null)
+          statsData.isNewConnection = false;
       }
     }
     closeQuietly(socket);

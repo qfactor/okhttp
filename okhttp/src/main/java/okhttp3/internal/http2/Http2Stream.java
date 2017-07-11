@@ -21,6 +21,8 @@ import java.io.InterruptedIOException;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.List;
+import okhttp3.StatisticsData;
+import okhttp3.StatisticsObserver;
 import okio.AsyncTimeout;
 import okio.Buffer;
 import okio.BufferedSource;
@@ -65,6 +67,9 @@ public final class Http2Stream {
   final StreamTimeout readTimeout = new StreamTimeout();
   final StreamTimeout writeTimeout = new StreamTimeout();
 
+  private StatisticsObserver observer;
+  private StatisticsData statsData; // This instance is shared across several objects.
+
   /**
    * The reason why this stream was abnormally closed. If there are multiple reasons to abnormally
    * close this stream (such as both peers closing it near-simultaneously) then this is the first
@@ -73,7 +78,7 @@ public final class Http2Stream {
   ErrorCode errorCode = null;
 
   Http2Stream(int id, Http2Connection connection, boolean outFinished, boolean inFinished,
-      List<Header> requestHeaders) {
+      List<Header> requestHeaders, StatisticsData statsData, StatisticsObserver observer) {
     if (connection == null) throw new NullPointerException("connection == null");
     if (requestHeaders == null) throw new NullPointerException("requestHeaders == null");
     this.id = id;
@@ -85,10 +90,20 @@ public final class Http2Stream {
     this.source.finished = inFinished;
     this.sink.finished = outFinished;
     this.requestHeaders = requestHeaders;
+    this.observer = observer;
+    this.statsData = statsData;
   }
 
   public int getId() {
     return id;
+  }
+
+  public void mergeHeaderStats(StatisticsData otherData) {
+    statsData.mergeHeaderStats(otherData);
+  }
+
+  public void mergeDataStats(StatisticsData otherData) {
+    statsData.mergeDataStats(otherData);
   }
 
   /**
@@ -180,7 +195,7 @@ public final class Http2Stream {
         outFinished = true;
       }
     }
-    connection.writeSynReply(id, outFinished, responseHeaders);
+    connection.writeSynReply(id, outFinished, responseHeaders, statsData);
 
     if (outFinished) {
       connection.flush();
@@ -292,6 +307,8 @@ public final class Http2Stream {
     if (!open) {
       connection.removeStream(id);
     }
+
+    statsData.reportCompleted(observer);
   }
 
   synchronized void receiveRstStream(ErrorCode errorCode) {
@@ -299,6 +316,11 @@ public final class Http2Stream {
       this.errorCode = errorCode;
       notifyAll();
     }
+  }
+
+  void resetStatistics(StatisticsData statsData) {
+    this.statsData.reportCompleted(observer);
+    this.statsData = statsData;
   }
 
   /**
@@ -390,6 +412,7 @@ public final class Http2Stream {
         if (flowControlError) {
           in.skip(byteCount);
           closeLater(ErrorCode.FLOW_CONTROL_ERROR);
+          statsData.reportAborted(observer);
           return;
         }
 
@@ -402,9 +425,10 @@ public final class Http2Stream {
         // Fill the receive buffer without holding any locks.
         long read = in.read(receiveBuffer, byteCount);
         if (read == -1) throw new EOFException();
+        statsData.byteCountBodyReceived += read;
         byteCount -= read;
 
-        // Move the received data to the read buffer to the reader can read it.
+        // Move the received data to the read buffer so the reader can read it.
         synchronized (Http2Stream.this) {
           boolean wasEmpty = readBuffer.size() == 0;
           readBuffer.writeAll(receiveBuffer);
@@ -505,7 +529,8 @@ public final class Http2Stream {
 
       writeTimeout.enter();
       try {
-        connection.writeData(id, outFinished && toWrite == sendBuffer.size(), sendBuffer, toWrite);
+        connection.writeData(id, outFinished && toWrite == sendBuffer.size(),
+                             sendBuffer, toWrite, statsData);
       } finally {
         writeTimeout.exitAndThrowIfTimedOut();
       }
@@ -539,7 +564,7 @@ public final class Http2Stream {
           }
         } else {
           // Send an empty frame just so we can set the END_STREAM flag.
-          connection.writeData(id, true, null, 0);
+          connection.writeData(id, true, null, 0, statsData);
         }
       }
       synchronized (Http2Stream.this) {
@@ -598,7 +623,10 @@ public final class Http2Stream {
     }
 
     public void exitAndThrowIfTimedOut() throws IOException {
-      if (exit()) throw newTimeoutException(null /* cause */);
+      if (exit()) {
+        statsData.reportAborted(observer);
+        throw newTimeoutException(null /* cause */);
+      }
     }
   }
 }
